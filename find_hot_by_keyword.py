@@ -61,6 +61,12 @@ def main():
         content = weibo.get('content', '').lower()
         # 如果微博内容包含关键词
         if args.keyword.lower() in content:
+            # 确保每条微博都有post_link
+            if 'post_link' not in weibo and 'weibo_id' in weibo:
+                weibo['post_link'] = f"https://weibo.com/detail/{weibo['weibo_id']}"
+            # 移除不需要的字段
+            for field in ['user_id', 'image_urls', 'local_image_paths']:
+                weibo.pop(field, None)
             keyword_weibos.append(weibo)
     
     print(f"其中 {len(keyword_weibos)} 条微博包含关键词 '{args.keyword}'")
@@ -115,18 +121,9 @@ def main():
     for i, weibo in enumerate(top_weibos, 1):
         text = weibo.get('content', '').replace('\n', ' ')
         print(f"\n{i}. 质量分数: {weibo.get('content_score', 0):.1f}")
-        print(f"用户: {weibo.get('user_name', '未知用户')}")
         print(f"内容: {text[:100]}{'...' if len(text) > 100 else ''}")
-        print(f"互动数据: 转发{weibo.get('forwards', 0)}, 评论{weibo.get('comments', 0)}, 点赞{weibo.get('likes', 0)}")
-        has_images = weibo.get('has_images', False)
-        has_videos = weibo.get('has_videos', False)
-        media_info = []
-        if has_images:
-            media_info.append("有图片")
-        if has_videos:
-            media_info.append("有视频")
-        if media_info:
-            print(f"媒体: {', '.join(media_info)}")
+        print(f"互动数据: 转发{weibo.get('reposts_count', 0)}, 评论{weibo.get('comments_count', 0)}, 点赞{weibo.get('attitudes_count', 0)}")
+        print(f"链接: {weibo.get('post_link', '无')}")
 
 if __name__ == "__main__":
     main() 

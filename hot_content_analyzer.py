@@ -40,6 +40,14 @@ class HotContentAnalyzer:
         """
         try:
             df = pd.read_csv(csv_file, encoding='utf-8-sig')
+            # Remove unwanted columns if they exist
+            columns_to_drop = ['user_id', 'image_urls', 'local_image_paths']
+            df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
+            
+            # Add post_link column if it doesn't exist
+            if 'post_link' not in df.columns:
+                df['post_link'] = df['weibo_id'].apply(lambda x: f"https://weibo.com/detail/{x}")
+            
             print(f"已加载 {len(df)} 条微博数据，来自 {csv_file}")
             return df.to_dict('records')
         except Exception as e:
@@ -230,17 +238,13 @@ class HotContentAnalyzer:
         # 创建可序列化的副本
         result_copy = result.copy()
         
-        # 处理appealing_content字段，移除无法序列化的内容
+        # 处理appealing_content字段
         if 'appealing_content' in result_copy:
             serializable_content = []
             for item in result_copy['appealing_content']:
-                item_copy = {}
-                for k, v in item.items():
-                    # 跳过无法序列化的字段
-                    if k in ['image_urls', 'video_urls', 'image_local_paths', 'video_local_paths']:
-                        item_copy[k] = str(v)
-                    else:
-                        item_copy[k] = v
+                item_copy = {k: v for k, v in item.items() if k not in ['user_id', 'image_urls', 'local_image_paths']}
+                if 'post_link' not in item_copy and 'weibo_id' in item_copy:
+                    item_copy['post_link'] = f"https://weibo.com/detail/{item_copy['weibo_id']}"
                 serializable_content.append(item_copy)
             result_copy['appealing_content'] = serializable_content
         
@@ -250,13 +254,9 @@ class HotContentAnalyzer:
             for cluster_id, cluster_data in result_copy['topic_clusters'].items():
                 weibos = []
                 for weibo in cluster_data.get('weibos', []):
-                    weibo_copy = {}
-                    for k, v in weibo.items():
-                        # 跳过无法序列化的字段
-                        if k in ['image_urls', 'video_urls', 'image_local_paths', 'video_local_paths']:
-                            weibo_copy[k] = str(v)
-                        else:
-                            weibo_copy[k] = v
+                    weibo_copy = {k: v for k, v in weibo.items() if k not in ['user_id', 'image_urls', 'local_image_paths']}
+                    if 'post_link' not in weibo_copy and 'weibo_id' in weibo_copy:
+                        weibo_copy['post_link'] = f"https://weibo.com/detail/{weibo_copy['weibo_id']}"
                     weibos.append(weibo_copy)
                 
                 serializable_clusters[str(cluster_id)] = {
@@ -326,6 +326,7 @@ class HotContentAnalyzer:
                     text = content.get('content', '').replace('\n', ' ')
                     f.write(f"   内容: {text[:100]}{'...' if len(text) > 100 else ''}\n")
                     f.write(f"   互动数据: 转发 {content.get('forwards', 0)}, 评论 {content.get('comments', 0)}, 点赞 {content.get('likes', 0)}\n")
+                    f.write(f"   链接: {content.get('post_link', '无')}\n")
                     f.write("\n")
             
             print(f"热门话题报告已生成: {output_file}")
@@ -413,6 +414,7 @@ def main():
             text = content.get('content', '').replace('\n', ' ')
             print(f"{i}. [{content.get('content_score', 0):.1f}分] {text[:50]}{'...' if len(text) > 50 else ''}")
             print(f"   - 用户: {content.get('user_name', '未知')}, 互动: 转发{content.get('forwards', 0)}, 评论{content.get('comments', 0)}, 点赞{content.get('likes', 0)}")
+            print(f"   - 链接: {content.get('post_link', '无')}")
 
 if __name__ == "__main__":
     main() 

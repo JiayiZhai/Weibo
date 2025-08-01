@@ -5,7 +5,7 @@ import os
 import json
 import logging
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from fetch import WeiboSpider
 from keyword_manager import KeywordManager
@@ -164,6 +164,43 @@ def download_filtered_media(spider, filtered_weibos, keyword):
     
     return downloaded_count
 
+def parse_weibo_time(time_str, now=None):
+    """
+    解析微博时间字符串为 datetime 对象。
+    支持格式：'5分钟前'、'今天 12:34'、'昨天 12:34'、'2024-05-23 12:34'等。
+    """
+    if now is None:
+        now = datetime.now()
+    time_str = str(time_str).strip()
+    if not time_str or time_str == '未知时间':
+        return None
+    try:
+        if '分钟前' in time_str:
+            minutes = int(time_str.replace('分钟前', '').strip())
+            return now - timedelta(minutes=minutes)
+        elif '小时前' in time_str:
+            hours = int(time_str.replace('小时前', '').strip())
+            return now - timedelta(hours=hours)
+        elif '今天' in time_str:
+            t = time_str.replace('今天', '').strip()
+            dt = datetime.strptime(t, '%H:%M')
+            return now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
+        elif '昨天' in time_str:
+            t = time_str.replace('昨天', '').strip()
+            dt = datetime.strptime(t, '%H:%M')
+            dt = now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0) - timedelta(days=1)
+            return dt
+        elif '-' in time_str:
+            # 可能是 '05-23 12:34' 或 '2024-05-23 12:34'
+            if len(time_str) == 11:  # '05-23 12:34'
+                t = f"{now.year}-{time_str}"
+                return datetime.strptime(t, '%Y-%m-%d %H:%M')
+            elif len(time_str) == 16:  # '2024-05-23 12:34'
+                return datetime.strptime(time_str, '%Y-%m-%d %H:%M')
+    except Exception:
+        pass
+    return None
+
 def process_keyword(keyword, spider, ml_analyzer, config, now, keyword_to_type):
     """处理单个关键词的爬取和分析"""
     try:
@@ -173,12 +210,12 @@ def process_keyword(keyword, spider, ml_analyzer, config, now, keyword_to_type):
         keyword_type = keyword_to_type.get(keyword, "unknown")
         logging.info(f"关键词 '{keyword}' 的分类: {keyword_type}")
         
-        # 获取搜索结果 - 暂时关闭媒体下载
+        # 获取搜索结果 - 强制关闭媒体下载
         results = spider.search_keyword(
             keyword, 
             pages=config["default_pages"], 
             start_page=config["start_page"],
-            download_media=False  # 先不下载，等筛选后再下载
+            download_media=False  # 强制关闭媒体下载
         )
         
         if not results:
@@ -187,10 +224,24 @@ def process_keyword(keyword, spider, ml_analyzer, config, now, keyword_to_type):
         
         logging.info(f"获取到 {len(results)} 条微博")
         
+        # ====== 筛选最近两天的微博（不再强制要求视频） ======
+        now_dt = datetime.now()
+        two_days_ago = now_dt - timedelta(days=2)
+        filtered_by_time = []
+        for weibo in results:
+            dt = parse_weibo_time(weibo.get('publish_time', ''), now=now_dt)
+            if dt and dt >= two_days_ago:
+                filtered_by_time.append(weibo)
+        logging.info(f"筛选后剩余 {len(filtered_by_time)} 条最近两天的微博")
+        if not filtered_by_time:
+            logging.warning(f"最近两天没有关键词 '{keyword}' 的相关微博")
+            return None
+        # ====== 后续分析用 filtered_by_time 替换 results ======
+        
         # 应用机器学习分析
         logging.info("正在进行机器学习分析...")
         analysis_result = ml_analyzer.analyze_weibos(
-            results, 
+            filtered_by_time, 
             min_score=config["min_score"],
             min_likes=config["min_likes"],  # 传递最低点赞数参数
             min_comments=config["min_comments"] if "min_comments" in config else 0,
@@ -208,17 +259,13 @@ def process_keyword(keyword, spider, ml_analyzer, config, now, keyword_to_type):
         for weibo in filtered_results:
             weibo['type'] = keyword_type
         
-        # 如果启用了媒体下载，为筛选后的微博下载图片
+        # 如果启用了媒体下载，为筛选后的微博下载图片 - 移除此功能
         if config["download_media"]:
-            logging.info(f"开始为 {keyword} 的高质量微博下载图片...")
-            downloaded_count = download_filtered_media(spider, filtered_results, keyword)
-            logging.info(f"为关键词 '{keyword}' 下载了 {downloaded_count} 张图片")
+            logging.info(f"媒体下载已禁用")
         
-        # 添加图片Base64数据到微博中
+        # 移除图片处理相关代码
         if config["download_media"]:
-            logging.info(f"正在处理图片数据...")
-            filtered_results = add_image_data_to_weibos(filtered_results)
-            logging.info(f"图片数据处理完成")
+            logging.info(f"图片处理已禁用")
         
         # 保存结果
         result_dir = "results"
@@ -227,6 +274,8 @@ def process_keyword(keyword, spider, ml_analyzer, config, now, keyword_to_type):
         # 保存过滤后的微博数据
         df = pd.DataFrame(filtered_results)
         df = clean_and_reorder_dataframe(df)  # 清理和重新排列列
+        # 按点赞量降序排序
+        df = df.sort_values(by='likes', ascending=False)
         keyword_file = f"{result_dir}/{keyword}_{now}.csv"
         df.to_csv(keyword_file, index=False, encoding='utf-8-sig')
         logging.info(f"已保存过滤后的结果到 {keyword_file}")
@@ -278,176 +327,208 @@ def load_keyword_classifications():
     return keyword_to_type
 
 def clean_and_reorder_dataframe(df):
-    """
-    清理和重新排列DataFrame的列
+    """清理并重新排序DataFrame"""
+    # 确保所有必要的列都存在
+    required_columns = ['weibo_id', 'content', 'publish_time', 'reposts_count', 'comments_count', 
+                        'attitudes_count', 'post_link', 'video_url', 'video_cover']
     
-    参数:
-    - df: 原始DataFrame
+    # 添加空列，如果不存在
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = ''
     
-    返回:
-    - 处理后的DataFrame
-    """
-    # 要删除的列（保留weibo_id用于图片画廊关联）
-    columns_to_remove = [
-        'user_link', 'video_urls', 'image_paths', 
-        'video_paths', 'has_images', 'has_videos', 'content_score', 'image_count', 'image_base64'
-    ]
+    # 删除用户名字段
+    if 'user_name' in df.columns:
+        df = df.drop(columns=['user_name'])
     
-    # 删除指定列（如果存在）
-    for col in columns_to_remove:
-        if col in df.columns:
-            df = df.drop(columns=[col])
+    # 确保post_link列非空，如果为空则使用weibo_id生成
+    if 'weibo_id' in df.columns:
+        mask = (df['post_link'].isna()) | (df['post_link'] == '')
+        df.loc[mask, 'post_link'] = df.loc[mask, 'weibo_id'].apply(
+            lambda x: f'https://weibo.com/detail/{x}'
+        )
     
-    # 数据清理函数
-    def clean_text(text):
-        if pd.isna(text) or text is None:
-            return ''
-        
-        # 转换为字符串
-        text = str(text)
-        
-        # 移除或替换问题字符
-        # 移除控制字符（除了换行符和制表符）
-        text = re.sub(r'[\x00-\x08\x0B-\x1F\x7F-\x9F]', '', text)
-        
-        # 规范化 Unicode 字符
-        text = unicodedata.normalize('NFKC', text)
-        
-        # 替换换行符为空格
-        text = re.sub(r'\r?\n', ' ', text)
-        
-        # 替换制表符为空格
-        text = re.sub(r'\t', ' ', text)
-        
-        # 移除多余的空格
-        text = re.sub(r'\s+', ' ', text)
-        
-        # 移除首尾空格
-        text = text.strip()
-        
-        # 处理CSV特殊字符（逗号、引号）
-        if ',' in text or '"' in text:
-            text = text.replace('"', '""')  # 转义双引号
-        
-        return text
+    # 清理content，保留纯文本
+    if 'content' in df.columns:
+        # 移除HTML标签
+        df['content'] = df['content'].astype(str).replace(r'<[^>]*>', '', regex=True)
+        # 移除微博特殊标记如[表情]
+        df['content'] = df['content'].replace(r'\[.*?\]', '', regex=True)
+        # 移除链接
+        df['content'] = df['content'].replace(r'http[s]?://\S+', '', regex=True)
+        # 移除多余空格和换行
+        df['content'] = df['content'].replace(r'\s+', ' ', regex=True).str.strip()
+        # 移除特殊Unicode字符
+        df['content'] = df['content'].replace(r'[\u200b-\u200f\u2028-\u202f\u205f-\u206f]', '', regex=True)
+        # 移除"​​​"结尾（这是微博文本常见的结尾）
+        df['content'] = df['content'].replace(r'​+$', '', regex=True)
     
-    # 对所有文本列进行清理
-    text_columns = ['content', 'user_name', 'publish_time']
-    for col in text_columns:
-        if col in df.columns:
-            df[col] = df[col].apply(clean_text)
+    # 重新排序列，优先显示重要信息
+    ordered_columns = ['keyword'] + required_columns
     
-    # 重新排列列顺序，将type放在第二列
-    if 'type' in df.columns and 'keyword' in df.columns:
-        # 获取所有列
-        all_columns = df.columns.tolist()
-        
-        # 移除keyword和type
-        remaining_columns = [col for col in all_columns if col not in ['keyword', 'type']]
-        
-        # 重新排序：keyword, type, 然后是其他列
-        new_order = ['keyword', 'type'] + remaining_columns
-        df = df[new_order]
+    # 只保留在ordered_columns中的列
+    existing_columns = [col for col in ordered_columns if col in df.columns]
     
-    return df
+    # 如果有其他额外的列，也保留
+    extra_columns = [col for col in df.columns if col not in ordered_columns]
+    
+    # 合并列顺序
+    final_columns = existing_columns + extra_columns
+    
+    return df[final_columns]
+
+def read_keywords(file_path):
+    """读取关键词列表文件"""
+    try:
+        # 如果文件路径是 "keywords.txt"，改为从 "keyword and classification.txt" 中读取
+        if file_path == 'keywords.txt':
+            classification_file = "keyword and classification.txt"
+            if os.path.exists(classification_file):
+                df = pd.read_csv(classification_file, encoding='utf-8')
+                # 从第一列（关键词列）提取关键词
+                if '关键词' in df.columns:
+                    return df['关键词'].dropna().tolist()
+                else:
+                    # 如果没有列名，就假设第一列是关键词
+                    return df.iloc[:, 0].dropna().tolist()
+            else:
+                print(f"文件 {classification_file} 不存在")
+                return []
+        else:
+            # 原始的从文本文件读取方式
+            with open(file_path, 'r', encoding='utf-8') as f:
+                # 过滤掉空行
+                return [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"读取{file_path}失败: {str(e)}")
+        return []
+
+def read_user_urls(file_path):
+    """读取用户URL列表文件"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # 过滤掉空行和注释行
+            return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    except Exception as e:
+        print(f"读取{file_path}失败: {str(e)}")
+        return []
+
+def has_video(row):
+    # Check video_url field
+    if pd.notna(row['video_url']) and row['video_url'].strip() != '':
+        return True
+    return False
+
+def process_weibo_data(df):
+    # Add has_video column and filter
+    df['has_video'] = df.apply(has_video, axis=1)
+    return df[df['has_video'] == True].drop('has_video', axis=1)
 
 def main():
-    try:
-        # 加载配置
-        config = load_config()
+    # 加载配置
+    config = load_config()
+    
+    # 读取关键词列表
+    keywords = read_keywords('keywords.txt')
+    if not keywords:
+        logging.error("未在keywords.txt中找到任何关键词")
+        return
+
+    logging.info(f"从keywords.txt中读取到 {len(keywords)} 个关键词")
+
+    # 读取关键词分类
+    keyword_to_type = load_keyword_classifications()
+    logging.info(f"加载了 {len(keyword_to_type)} 个关键词分类信息")
+
+    # 读取用户URL列表
+    user_urls = read_user_urls('user_urls.txt')
+    if not user_urls:
+        logging.error("user_urls.txt中没有找到有效的用户URL")
+        return
+
+    logging.info(f"从user_urls.txt中读取到 {len(user_urls)} 个用户URL")
+
+    # 创建爬虫实例
+    spider = WeiboSpider()
+
+    # 创建结果目录
+    result_dir = "results"
+    os.makedirs(result_dir, exist_ok=True)
+
+    # 当前时间，用于文件命名
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 存储所有结果
+    all_results = []
+
+    # 处理每个用户
+    for i, user_url in enumerate(user_urls, 1):
+        logging.info(f"\n处理第 {i}/{len(user_urls)} 个用户: {user_url}")
+        user_id = spider._extract_user_id(user_url) or f"user_{i}"
         
-        # 创建结果目录
-        result_dir = "results"
-        os.makedirs(result_dir, exist_ok=True)
-        
-        # 创建关键词管理器
-        keyword_manager = KeywordManager()
-        
-        # 从文件加载关键词
-        keywords = keyword_manager.load_from_file()
-        
-        # 如果没有关键词，使用默认的示例关键词
-        if not keywords:
-            logging.warning("未找到关键词文件或文件为空，使用示例关键词")
-            keywords = [
-                "示例关键词1",
-                "示例关键词2",
-                "示例关键词3",
-            ]
-            # 保存示例关键词到文件
-            keyword_manager.add_keywords(keywords)
-            keyword_manager.save_to_file()
-        
-        # 当前时间，用于文件命名
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 创建爬虫实例
-        spider = WeiboSpider()
-        
-        # 设置代理（如果配置了的话）
-        if config["proxy"]:
-            spider.set_proxy(config["proxy"])
-        
-        # 使用配置文件中的Cookie
-        if config["cookie"]:
-            spider.set_cookies(config["cookie"])
-            logging.info("已从配置文件加载Cookie")
-        # else:
-        #     # 如果没有配置Cookie，提示用户输入
-        #     cookie_str = input("请输入微博Cookie（可选，提高爬取成功率）: ")
-        #     if cookie_str:
-        #         spider.set_cookies(cookie_str)
-        #         # 保存Cookie到配置文件
-        #         config["cookie"] = cookie_str
-        #         save_config(config)
-        
-        # 提示用户输入最低点赞数
+        # 对每个关键词进行搜索
+        for keyword in keywords:
+            logging.info(f"\n搜索关键词: {keyword}")
+            try:
+                # 爬取该用户的微博
+                results = spider.search_keyword(
+                    user_url=user_url,
+                    keyword=keyword,
+                    pages=1,  # 固定为1页
+                    download_media=config["download_media"]
+                )
+                
+                if results:
+                    # 为每条微博添加用户ID和关键词信息
+                    for result in results:
+                        result['user_id'] = user_id
+                        result['keyword'] = keyword
+                    all_results.extend(results)
+                    logging.info(f"找到 {len(results)} 条包含关键词 '{keyword}' 的微博")
+                else:
+                    logging.info(f"未找到包含关键词 '{keyword}' 的微博")
+                
+            except Exception as e:
+                logging.error(f"处理关键词 {keyword} 时出错: {str(e)}")
+                continue
+
+    # 保存所有结果到CSV文件
+    if all_results:
         try:
-            # 使用配置文件中的值，而不是硬编码
-            min_likes = config['min_likes']
-            logging.info(f"使用配置文件中的最低点赞数阈值: {min_likes}")
-        except ValueError:
-            logging.warning(f"配置无效，使用默认值{config['min_likes']}")
-            min_likes = config['min_likes']
-        
-        logging.info(f"筛选逻辑: 只保留点赞数 >= {min_likes} 的微博，并对这些微博进行综合评分和排序")
-        
-        # 创建机器学习分析器实例
-        logging.info("正在初始化机器学习分析器...")
-        ml_analyzer = MLAnalyzer()
-        logging.info("机器学习分析器初始化完成")
-        
-        # 加载关键词分类信息
-        keyword_to_type = load_keyword_classifications()
-        
-        # 使用线程池处理关键词
-        all_results = []
-        with ThreadPoolExecutor(max_workers=config["thread_pool_size"]) as executor:
-            # 提交所有任务
-            future_to_keyword = {
-                executor.submit(process_keyword, keyword, spider, ml_analyzer, config, now, keyword_to_type): keyword 
-                for keyword in keywords
-            }
-            
-            # 收集结果
-            for future in future_to_keyword:
-                keyword = future_to_keyword[future]
-                try:
-                    results = future.result()
-                    if results:
-                        all_results.extend(results)
-                except Exception as e:
-                    logging.error(f"处理关键词 '{keyword}' 时出错: {e}")
-        
-        # 保存所有结果到一个合并文件
-        if all_results:
+            # 转换为DataFrame
             df_all = pd.DataFrame(all_results)
-            df_all = clean_and_reorder_dataframe(df_all)  # 清理和重新排列列
-            all_file = f"{result_dir}/all_results_{now}.csv"
-            df_all.to_csv(all_file, index=False, encoding='utf-8-sig')
-            logging.info(f"\n已保存所有结果到 {all_file}")
-            logging.info(f"总共获取到 {len(all_results)} 条高质量微博")
             
+            # 清理和重新排序DataFrame
+            df_all = clean_and_reorder_dataframe(df_all)
+            
+            # 添加分类信息
+            df_all['keyword_type'] = df_all['keyword'].map(keyword_to_type).fillna('other')
+            
+            # 先按关键词分类排序（show类别优先），然后按点赞量降序排序
+            df_all['is_show'] = (df_all['keyword_type'] == 'show').astype(int)
+            df_all = df_all.sort_values(by=['is_show', 'attitudes_count'], ascending=[False, False])
+            
+            # 删除辅助排序列
+            if 'is_show' in df_all.columns:
+                df_all = df_all.drop(columns=['is_show'])
+            if 'keyword_type' in df_all.columns:
+                df_all = df_all.drop(columns=['keyword_type'])
+            
+            # 不再过滤视频，保留所有微博
+            
+            # 保存为CSV
+            output_file = os.path.join(result_dir, f"all_results_{now}.csv")
+            df_all.to_csv(output_file, index=False, encoding='utf-8-sig')
+            
+            # 删除多余字段，只保留指定字段
+            keep_columns = ['keyword', 'weibo_id', 'content', 'publish_time', 'reposts_count', 'comments_count', 'attitudes_count', 'post_link']
+            existing_keep_columns = [col for col in keep_columns if col in df_all.columns]
+            df_filtered = df_all[existing_keep_columns]
+            df_filtered.to_csv(output_file, index=False, encoding='utf-8-sig')
+            
+            logging.info(f"\n已保存所有微博到: {output_file}")
+            logging.info(f"总共获取到 {len(df_all)} 条微博")
+
             # 自动生成图片画廊
             try:
                 from create_simple_gallery import create_simple_gallery
@@ -484,13 +565,11 @@ def main():
             except ImportError:
                 logging.warning("图片画廊生成器模块未找到，跳过画廊生成")
             except Exception as e:
-                logging.error(f"生成图片画廊时出错: {e}")
-        else:
-            logging.warning("未获取到任何结果，无法生成画廊")
-        
-    except Exception as e:
-        logging.error(f"程序运行出错: {e}")
-        raise
+                pass  # 忽略画廊生成错误
+        except Exception as e:
+            logging.error(f"保存结果到CSV时出错: {str(e)}")
+    else:
+        logging.warning("未获取到任何结果")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

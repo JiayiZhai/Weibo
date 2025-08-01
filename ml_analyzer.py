@@ -124,16 +124,40 @@ class MLAnalyzer:
     
     def preprocess_text(self, text):
         """
-        预处理文本
+        预处理文本内容
         
         参数:
-        - text: 待处理的文本
+        - text: 原始文本
         
         返回:
         - 处理后的文本
         """
-        if not text or text == "无内容":
+        if not text:
             return ""
+            
+        try:
+            # 转换为字符串
+            text = str(text)
+            
+            # 移除HTML标签
+            text = re.sub(r'<[^>]+>', '', text)
+            
+            # 移除URL
+            text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+            
+            # 移除表情符号和特殊字符
+            text = re.sub(r'[\U0001F300-\U0001F9FF]', '', text)
+            
+            # 移除所有换行符和多余的空格
+            text = re.sub(r'\s+', ' ', text)
+            
+            # 移除首尾空格
+            text = text.strip()
+            
+            return text
+            
+        except Exception as e:
+            print(f"预处理文本时出错: {e}")
         
         # 去除HTML标签
         text = re.sub(r'<[^>]+>', '', text)
@@ -479,10 +503,10 @@ class MLAnalyzer:
         
         参数:
         - weibo_list: 微博数据列表
-        - min_score: 过滤噪声的最低分数阈值（已弃用，保留参数为了兼容性）
-        - min_likes: 最低点赞数（默认500）
-        - min_comments: 最低评论数（默认0）
-        - min_forwards: 最低转发数（默认0）
+        - min_score: 过滤噪声的最低分数阈值
+        - min_likes: 最低点赞数
+        - min_comments: 最低评论数
+        - min_forwards: 最低转发数
         - n_clusters: 聚类数量
         
         返回:
@@ -495,17 +519,30 @@ class MLAnalyzer:
             print(f"开始分析 {len(weibo_list)} 条微博...")
             
             # 1. 数据预处理
+            processed_weibos = []
             for weibo in weibo_list:
-                weibo['content'] = self.preprocess_text(weibo.get('content', ''))
+                # 移除不需要的字段
+                weibo_copy = {k: v for k, v in weibo.items() 
+                            if k not in ['user_id', 'image_urls', 'local_image_paths', 'source']}
+                
+                # 确保有post_link
+                if 'post_link' not in weibo_copy and 'weibo_id' in weibo_copy:
+                    weibo_copy['post_link'] = f"https://weibo.com/detail/{weibo_copy['weibo_id']}"
+                
+                # 预处理文本内容
+                if 'content' in weibo_copy:
+                    weibo_copy['content'] = self.preprocess_text(weibo_copy['content'])
+                
+                processed_weibos.append(weibo_copy)
             
-            # 2. 过滤噪声 - 传递所有筛选参数
-            filtered_weibos = self.filter_noise(
-                weibo_list, 
-                min_score=min_score, 
-                min_likes=min_likes,
-                min_comments=min_comments,
-                min_forwards=min_forwards
-            )
+            # 2. 过滤噪声
+            filtered_weibos = []
+            for weibo in processed_weibos:
+                if (int(weibo.get('attitudes_count', 0)) >= min_likes and
+                    int(weibo.get('comments_count', 0)) >= min_comments and
+                    int(weibo.get('reposts_count', 0)) >= min_forwards):
+                    filtered_weibos.append(weibo)
+            
             print(f"过滤后保留 {len(filtered_weibos)} 条有价值内容")
             print(f"筛选条件: 点赞数 >= {min_likes}, 评论数 >= {min_comments}, 转发数 >= {min_forwards}")
             
